@@ -1,4 +1,4 @@
-"""Produce one row of movie box office per cinema from a MovieData export."""
+"""Export per-cinema movie box office totals and daily detail from MovieData."""
 from __future__ import annotations
 
 import argparse
@@ -18,12 +18,21 @@ from zipfile import ZipFile
 import xlsxwriter
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DETAIL_SUFFIX = "_cinema_days.csv"
 DETAIL_FIELDS = {"date", "cinema_code", "movie_code", "status", "sales_fen"}
 FILENAME = re.compile(r"([0-9]{1,30})_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_cinema_days\.csv", re.I)
 VERIFIED = {"with_movie", "without_movie"}
 EMPTY = {"empty_204", "deferred_204"}
+STATUS_LABELS = {
+    "with_movie": "已核查，有该片",
+    "without_movie": "已核查，无该片",
+    "empty_204": "HTTP 204 待复核",
+    "deferred_204": "HTTP 204 待复核",
+    "missing": "未采集",
+    "inconsistent": "数据不一致，待复核",
+    "error": "采集异常",
+}
 MAX_CENTS = 999_999_999_999_999
 MAX_ROWS = 1_048_576
 HEADER_ROW = 5
@@ -136,7 +145,7 @@ def _read_report(conn, source, emit):
             raise ValueError("导出文件名中的结束日期早于开始日期。")
 
     # A duplicate key can never increase the box office or the verified day count.
-    conn.execute("CREATE TABLE seen(day TEXT, cinema TEXT, status TEXT, cents INTEGER, PRIMARY KEY(day,cinema)) WITHOUT ROWID")
+    conn.execute("CREATE TABLE seen(day TEXT, cinema TEXT, status TEXT, cents INTEGER, name TEXT, PRIMARY KEY(day,cinema)) WITHOUT ROWID")
     cinemas = {}
     earliest = latest = None
     with source.open() as handle:
@@ -162,7 +171,8 @@ def _read_report(conn, source, emit):
                     raise ValueError("日期超出了文件名标明的导出区间。")
                 cents = _known_cents(status, raw_fen)
                 key = day.isoformat(), code
-                inserted = conn.execute("INSERT OR IGNORE INTO seen VALUES (?,?,?,?)", (*key, status, cents))
+                label = row.get("cinema_name", "").strip()
+                inserted = conn.execute("INSERT OR IGNORE INTO seen VALUES (?,?,?,?,?)", (*key, status, cents, label))
                 if not inserted.rowcount:
                     old = conn.execute("SELECT status,cents FROM seen WHERE day=? AND cinema=?", key).fetchone()
                     if old != (status, cents):
@@ -175,7 +185,6 @@ def _read_report(conn, source, emit):
                 if code not in cinemas:
                     cinemas[code] = Cinema()
                 cinema = cinemas[code]
-                label = row.get("cinema_name", "").strip()
                 if label and day > cinema.name_day:
                     cinema.name, cinema.name_day = label, day
                 if cents is not None:
@@ -193,7 +202,7 @@ def _read_report(conn, source, emit):
     return Report(movie, first or earliest, last or latest, cinemas, not bool(name))
 
 
-def _write_report(path, scratch, report, source):
+def _write_report(path, scratch, report, source, conn, emit):
     headings = ("影院编码", "影院名称", "已确认票房（元）", "完整区间票房（元）", "核查状态",
                 "已核查天数", "待核查天数", "204 待复核天数", "有该片天数")
     widths = (15, 43, 23, 25, 21, 16, 16, 20, 15)
@@ -242,6 +251,67 @@ def _write_report(path, scratch, report, source):
                 sheet.write_string(row, 4, status, incomplete if pending_days or report.inferred_period else None)
                 sheet.write_row(row, 5, (cinema.verified, pending_days, cinema.deferred, cinema.with_movie))
             sheet.autofilter(HEADER_ROW, 0, row, len(headings) - 1)
+        _write_daily(book, report, source, conn, emit)
+
+
+def _write_daily(book, report, source, conn, emit):
+    headings = ("日期", "影院编码", "影院名称", "该片当日票房（元）", "采集状态", "原始状态", "电影编码")
+    widths = (15, 15, 43, 24, 29, 20, 18)
+    title = book.add_format({"font_name": "Microsoft YaHei", "font_size": 17, "bold": True, "font_color": "#17365D"})
+    note = book.add_format({"font_color": "#475972", "font_size": 10})
+    header = book.add_format({"bg_color": "#214D7B", "font_color": "white", "bold": True,
+                              "valign": "vcenter", "text_wrap": True})
+    money = book.add_format({"num_format": "#,##0.00", "font_color": "#17365D"})
+    date_format = book.add_format({"num_format": "yyyy-mm-dd"})
+    pending = book.add_format({"bg_color": "#FFF3E8", "font_color": "#943C21"})
+    codes = sorted(report.cinemas)
+    sheet, row, part = None, MAX_ROWS, 0
+    total = len(codes) * report.days
+    written = 0
+    for offset in range(report.days):
+        day = report.start + dt.timedelta(days=offset)
+        cursor = conn.execute("SELECT cinema,status,cents,name FROM seen WHERE day=? ORDER BY cinema", (day.isoformat(),))
+        record = next(cursor, None)
+        for code in codes:
+            if row == MAX_ROWS:
+                if sheet is not None:
+                    sheet.autofilter(HEADER_ROW, 0, row - 1, len(headings) - 1)
+                part += 1
+                sheet = book.add_worksheet("逐日明细" if part == 1 else f"逐日明细 {part}")
+                sheet.hide_gridlines(2)
+                sheet.set_zoom(90)
+                for column, width in enumerate(widths):
+                    sheet.set_column(column, column, width)
+                sheet.set_row(0, 28)
+                sheet.write_string(0, 0, "每家影院每日票房", title)
+                inferred = "（按明细中的日期推定）" if report.inferred_period else ""
+                sheet.write_string(1, 0, f"电影编码 {report.movie}   ·   {report.start} 至 {report.end}   ·   共 {report.days} 天{inferred}", note)
+                sheet.write_string(2, 0, "每家已知影院每天一行。金额单位为元。204、未采集、异常及缺行的金额留空，已核查无该片记 0。", note)
+                sheet.write_string(3, 0, f"来源 {source.name}   ·   可按日期或影院筛选，全国名单覆盖待核实。", note)
+                sheet.set_row(HEADER_ROW, 30)
+                sheet.write_row(HEADER_ROW, 0, headings, header)
+                sheet.freeze_panes(HEADER_ROW + 1, 3)
+                row = HEADER_ROW + 1
+            name = report.cinemas[code].name
+            if record is not None and record[0] == code:
+                _, status, cents, daily_name = record
+                name = daily_name or name
+                status_text = STATUS_LABELS.get(status, "未知状态，待复核")
+                record = next(cursor, None)
+            else:
+                status, cents, status_text = "", None, "源文件缺行，待核查"
+            sheet.write_datetime(row, 0, day, date_format)
+            sheet.write_string(row, 1, code)
+            sheet.write_string(row, 2, name[:32_767])
+            if cents is not None:
+                sheet.write_number(row, 3, Decimal(cents) / 100, money)
+            sheet.write_string(row, 4, status_text, pending if cents is None else None)
+            sheet.write_string(row, 5, status[:32_767])
+            sheet.write_string(row, 6, report.movie)
+            row += 1
+            written += 1
+        emit(f"已生成 {written:,} / {total:,} 行逐日明细…")
+    sheet.autofilter(HEADER_ROW, 0, row - 1, len(headings) - 1)
 
 
 def convert(source, output, *, emit=lambda message: None):
@@ -253,9 +323,9 @@ def convert(source, output, *, emit=lambda message: None):
         emit("正在读取影院日明细…")
         with closing(sqlite3.connect(scratch / "seen.db")) as conn:
             report = _read_report(conn, source, emit)
-        emit(f"正在生成 {len(report.cinemas):,} 家影院的票房表…")
-        local = scratch / "report.xlsx"
-        _write_report(local, scratch, report, source)
+            emit(f"正在生成 {len(report.cinemas):,} 家影院的区间汇总与逐日明细…")
+            local = scratch / "report.xlsx"
+            _write_report(local, scratch, report, source, conn, emit)
         os.replace(local, output)
     return len(report.cinemas)
 

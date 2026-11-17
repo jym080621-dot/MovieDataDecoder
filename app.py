@@ -40,30 +40,41 @@ class App(tk.Tk):
         main = ttk.Frame(self, padding=26)
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
-        ttk.Label(main, text="MovieDataDecoder", font=("Microsoft YaHei UI", 24, "bold")).grid(sticky="w")
-        ttk.Label(main, text="每家影院一行，查看这部电影的票房", font=("Microsoft YaHei UI", 11)).grid(sticky="w", pady=(3, 20))
+        main.rowconfigure(7, weight=1)
+        ttk.Label(main, text="MovieDataDecoder", font=("Microsoft YaHei UI", 24, "bold")).grid(row=0, sticky="w")
+        ttk.Label(main, text="每家影院的区间票房与每天明细", font=("Microsoft YaHei UI", 11)).grid(row=1, sticky="w", pady=(3, 20))
         toolbar = ttk.Frame(main)
-        toolbar.grid(sticky="ew")
+        toolbar.grid(row=2, sticky="ew")
         self.pick_file = ttk.Button(toolbar, text="选择文件…", command=self.select_file)
         self.pick_file.pack(side="left")
         self.pick_folder = ttk.Button(toolbar, text="选择文件夹…", command=self.select_folder)
         self.pick_folder.pack(side="left", padx=10)
-        ttk.Label(main, textvariable=self.source, wraplength=600).grid(sticky="w", pady=(11, 5))
-        self.choice = ttk.Combobox(main, state="disabled", width=45)
-        self.choice.grid(sticky="ew")
+        # One scrollable line preserves the full path without growing the layout.
+        self.source_entry = ttk.Entry(main, textvariable=self.source, state="readonly", width=1)
+        self.source_entry.grid(row=3, sticky="ew", pady=(11, 5))
+        self.choice = ttk.Combobox(main, state="disabled", width=1)
+        self.choice.grid(row=4, sticky="ew")
         self.choice.bind("<<ComboboxSelected>>", self.describe)
-        ttk.Label(main, textvariable=self.note, wraplength=600).grid(sticky="w", pady=(8, 10))
-        ttk.Separator(main).grid(sticky="ew", pady=16)
+        self.note_label = ttk.Label(main, textvariable=self.note, wraplength=560, width=1)
+        self.note_label.grid(row=5, sticky="ew", pady=(8, 10))
+        ttk.Separator(main).grid(row=6, sticky="ew", pady=12)
         actions = ttk.Frame(main)
-        actions.grid(sticky="ew")
+        actions.grid(row=8, sticky="ew")
         self.generate = ttk.Button(actions, text="导出逐影院票房…", style="Primary.TButton", command=self.start, state="disabled")
         self.generate.pack(side="left")
         self.open_button = ttk.Button(actions, text="打开 Excel", command=self.open_report, state="disabled")
         self.open_button.pack(side="left", padx=10)
         self.progress = ttk.Progressbar(main, mode="indeterminate")
-        self.progress.grid(pady=(15, 5), sticky="ew")
-        ttk.Label(main, textvariable=self.status, wraplength=600).grid(sticky="w")
+        self.progress.grid(row=9, pady=(15, 5), sticky="ew")
+        self.status_label = ttk.Label(main, textvariable=self.status, wraplength=560, width=1)
+        self.status_label.grid(row=10, sticky="ew")
+        main.bind("<Configure>", self.resize_text)
         self.timer = self.after(100, self.poll)
+
+    def resize_text(self, event):
+        width = max(1, event.width - 52)
+        self.note_label.configure(wraplength=width)
+        self.status_label.configure(wraplength=width)
 
     def select_file(self):
         path = filedialog.askopenfilename(parent=self, title="选择电影的影院明细", filetypes=[
@@ -88,8 +99,10 @@ class App(tk.Tk):
         self.results = items
         self.origin = path
         self.source.set(str(path))
+        self.source_entry.xview_moveto(1)
         self.choice.configure(values=[item.location for item in items], state="readonly")
         self.choice.current(0)
+        self.choice.xview_moveto(1)
         self.status.set(f"找到 {len(items):,} 份电影影院明细")
         self.describe()
 
@@ -97,7 +110,8 @@ class App(tk.Tk):
         selected = self.choice.current()
         if selected < 0:
             return
-        self.note.set("Excel 会按已确认票房排序。区间未核查齐的影院保留已确认金额，完整区间票房留空。")
+        self.note.set("「逐影院票房」显示区间汇总，按已确认票房排序。\n"
+                      "「逐日明细」显示每天金额与采集状态，可按日期或影院筛选。")
         self.generate.configure(state="normal")
 
     def start(self):
@@ -146,7 +160,7 @@ class App(tk.Tk):
                     messagebox.showerror("转换失败", info[0], parent=self)
                 else:
                     rows, self.written = info
-                    self.status.set(f"已导出 {rows:,} 家影院的票房 · {self.written.name}")
+                    self.status.set(f"已导出 {rows:,} 家影院的区间汇总与逐日明细")
                 self.open_button.configure(state="normal" if self.written else "disabled")
         except queue.Empty:
             pass

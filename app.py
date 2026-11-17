@@ -8,7 +8,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from decoder import VERSION, convert, discover
+from decoder import NO_DETAILS, VERSION, convert, discover
 
 
 class App(tk.Tk):
@@ -34,15 +34,14 @@ class App(tk.Tk):
         self.written = None
         self.origin = None
         self.source = tk.StringVar(value="尚未选择导出结果")
-        self.note = tk.StringVar(value="选择一个 CSV、ZIP、逐日汇总 JSON，或 MovieData 的 output 文件夹。")
-        self.only_movie = tk.BooleanVar(value=False)
+        self.note = tk.StringVar(value="选择影院明细 CSV，或包含该文件的 ZIP / 文件夹。")
         self.status = tk.StringVar(value="等待选择文件")
 
         main = ttk.Frame(self, padding=26)
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
         ttk.Label(main, text="MovieDataDecoder", font=("Microsoft YaHei UI", 24, "bold")).grid(sticky="w")
-        ttk.Label(main, text="把采集结果转换成易读的 Excel 表", font=("Microsoft YaHei UI", 11)).grid(sticky="w", pady=(3, 20))
+        ttk.Label(main, text="每家影院一行，查看这部电影的票房", font=("Microsoft YaHei UI", 11)).grid(sticky="w", pady=(3, 20))
         toolbar = ttk.Frame(main)
         toolbar.grid(sticky="ew")
         self.pick_file = ttk.Button(toolbar, text="选择文件…", command=self.select_file)
@@ -54,12 +53,10 @@ class App(tk.Tk):
         self.choice.grid(sticky="ew")
         self.choice.bind("<<ComboboxSelected>>", self.describe)
         ttk.Label(main, textvariable=self.note, wraplength=600).grid(sticky="w", pady=(8, 10))
-        self.filter = ttk.Checkbutton(main, text="明细只显示含目标电影的影院日", variable=self.only_movie, state="disabled")
-        self.filter.grid(sticky="w")
         ttk.Separator(main).grid(sticky="ew", pady=16)
         actions = ttk.Frame(main)
         actions.grid(sticky="ew")
-        self.generate = ttk.Button(actions, text="生成 Excel…", style="Primary.TButton", command=self.start, state="disabled")
+        self.generate = ttk.Button(actions, text="导出逐影院票房…", style="Primary.TButton", command=self.start, state="disabled")
         self.generate.pack(side="left")
         self.open_button = ttk.Button(actions, text="打开 Excel", command=self.open_report, state="disabled")
         self.open_button.pack(side="left", padx=10)
@@ -69,9 +66,8 @@ class App(tk.Tk):
         self.timer = self.after(100, self.poll)
 
     def select_file(self):
-        path = filedialog.askopenfilename(parent=self, title="选择 MovieData 导出结果", filetypes=[
-            ("MovieData 结果", "*.csv *.zip *.json"), ("CSV 文件", "*.csv"), ("ZIP 压缩包", "*.zip"),
-            ("汇总 JSON", "*.json"), ("所有文件", "*.*"),
+        path = filedialog.askopenfilename(parent=self, title="选择电影的影院明细", filetypes=[
+            ("影院明细或压缩包", "*.csv *.zip"), ("影院明细 CSV", "*_cinema_days.csv"), ("ZIP 压缩包", "*.zip"),
         ])
         if path:
             self.load(Path(path))
@@ -85,31 +81,23 @@ class App(tk.Tk):
         try:
             items = discover(path)
             if not items:
-                raise ValueError("未找到可转换的结果。可在 MovieData 点「导出当前 CSV / 审计」后再选择。")
+                raise ValueError(NO_DETAILS)
         except Exception as exc:
             messagebox.showerror("无法读取结果", str(exc), parent=self)
             return
         self.results = items
         self.origin = path
         self.source.set(str(path))
-        self.choice.configure(values=[item.description for item in items], state="readonly")
+        self.choice.configure(values=[item.location for item in items], state="readonly")
         self.choice.current(0)
-        self.status.set(f"找到 {len(items):,} 份可转表结果")
+        self.status.set(f"找到 {len(items):,} 份电影影院明细")
         self.describe()
 
     def describe(self, _event=None):
         selected = self.choice.current()
         if selected < 0:
             return
-        data = self.results[selected]
-        hints = {
-            "detail": "生成结果概览、每日汇总和可筛选的影院明细。",
-            "audit": "生成每日核查汇总，票房留空。完整金额来自影院日明细。",
-            "summary": "生成每日核查汇总，票房留空。完整金额来自影院日明细。",
-            "csv": "生成带筛选和冻结表头的 Excel 表格，影院及影片编码保留前导零。",
-        }
-        self.note.set(hints[data.kind] + (" 将同时核对配套逐日审计。" if data.audit else ""))
-        self.filter.configure(state="normal" if data.kind == "detail" else "disabled")
+        self.note.set("Excel 会按已确认票房排序。区间未核查齐的影院保留已确认金额，完整区间票房留空。")
         self.generate.configure(state="normal")
 
     def start(self):
@@ -121,18 +109,18 @@ class App(tk.Tk):
                                             initialfile=data.filename, defaultextension=".xlsx",
                                             filetypes=[("Excel 工作簿", "*.xlsx")])
         if path:
-            self.begin_conversion(data, Path(path), self.only_movie.get() and data.kind == "detail")
+            self.begin_conversion(data, Path(path))
 
-    def begin_conversion(self, data, output, only_movie=False):
+    def begin_conversion(self, data, output):
         self.busy = True
-        for control in (self.pick_file, self.pick_folder, self.choice, self.filter, self.generate, self.open_button):
+        for control in (self.pick_file, self.pick_folder, self.choice, self.generate, self.open_button):
             control.configure(state="disabled")
         self.status.set("正在转换…")
         self.progress.start(15)
 
         def worker():
             try:
-                rows = convert(data, output, only_movie=only_movie, emit=lambda text: self.work.put(("progress", text)))
+                rows = convert(data, output, emit=lambda text: self.work.put(("progress", text)))
                 self.work.put(("done", rows, output))
             except Exception as exc:
                 self.work.put(("error", str(exc)))
@@ -158,7 +146,7 @@ class App(tk.Tk):
                     messagebox.showerror("转换失败", info[0], parent=self)
                 else:
                     rows, self.written = info
-                    self.status.set(f"处理完成 · {rows:,} 条记录 · {self.written.name}")
+                    self.status.set(f"已导出 {rows:,} 家影院的票房 · {self.written.name}")
                 self.open_button.configure(state="normal" if self.written else "disabled")
         except queue.Empty:
             pass

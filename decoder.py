@@ -5,10 +5,12 @@ import argparse
 import csv
 import datetime as dt
 import io
+import math
 import os
 import re
 import sqlite3
 import tempfile
+import unicodedata
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -18,7 +20,7 @@ from zipfile import ZipFile
 import xlsxwriter
 
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DETAIL_SUFFIX = "_cinema_days.csv"
 DETAIL_FIELDS = {"date", "cinema_code", "movie_code", "status", "sales_fen"}
 FILENAME = re.compile(r"([0-9]{1,30})_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_cinema_days\.csv", re.I)
@@ -202,68 +204,131 @@ def _read_report(conn, source, emit):
     return Report(movie, first or earliest, last or latest, cinemas, not bool(name))
 
 
+def _report_styles(book):
+    base = {"font_name": "Microsoft YaHei", "font_size": 10, "font_color": "#27394B", "valign": "vcenter"}
+    styles = {
+        "title": book.add_format({**base, "font_size": 16, "bold": True, "font_color": "#203B58"}),
+        "context": book.add_format({**base, "font_color": "#405C76"}),
+        "note": book.add_format({**base, "font_color": "#63758A"}),
+        "source": book.add_format({**base, "font_color": "#63758A", "bottom": 1, "bottom_color": "#CFDCE6"}),
+        "link": book.add_format({**base, "font_color": "#1C6284", "underline": True}),
+        "pending": book.add_format({"bg_color": "#FFF2D9", "font_color": "#8A591A"}),
+        "error": book.add_format({"bg_color": "#FBE8E8", "font_color": "#A53036", "bold": True}),
+    }
+    styles["headers"] = [book.add_format({**base, "bg_color": color, "font_color": "#FFFFFF",
+                                          "bold": True, "text_wrap": True, "align": "center",
+                                          "right": 1, "right_color": "#FFFFFF"})
+                         for color in ("#263E58", "#1D607C", "#52667B")]
+    styles["rows"] = []
+    for fill in ("#FFFFFF", "#F2F6FA"):
+        row_base = {**base, "bg_color": fill}
+        styles["rows"].append({
+            "code": book.add_format({**row_base, "num_format": "@", "align": "center", "font_color": "#5D7185"}),
+            "name": book.add_format({**row_base, "align": "left", "indent": 1, "text_wrap": True}),
+            "money": book.add_format({**row_base, "num_format": "#,##0.00", "align": "right", "indent": 1,
+                                       "font_size": 11, "bold": True, "font_color": "#194F6E"}),
+            "count": book.add_format({**row_base, "num_format": "#,##0", "align": "right", "indent": 1}),
+            "status": book.add_format({**row_base, "align": "center"}),
+            "date": book.add_format({**row_base, "num_format": "yyyy-mm-dd", "align": "center", "font_color": "#405C76"}),
+        })
+    return styles
+
+
+def _prepare_sheet(sheet, report, source, styles, headings, widths, money_columns, frozen, description, other_sheet):
+    sheet.hide_gridlines(2)
+    sheet.set_zoom(90)
+    sheet.set_default_row(26)
+    sheet.set_tab_color("#263E58" if frozen == 2 else "#1D607C")
+    for column, width in enumerate(widths):
+        sheet.set_column(column, column, width)
+    sheet.set_row(0, 9)
+    sheet.set_row(1, 32)
+    sheet.write_string(1, 0, "逐影院票房" if frozen == 2 else "每家影院每日票房", styles["title"])
+    sheet.write_url(1, len(widths) - 3, f"internal:'{other_sheet}'!A1", styles["link"], f"查看{other_sheet}")
+    sheet.set_row(2, 24)
+    inferred = "（日期范围按明细推定）" if report.inferred_period else ""
+    sheet.write_string(2, 0, f"电影编码 {report.movie}    {report.start} 至 {report.end}    {report.days} 天    {len(report.cinemas):,} 家已知影院{inferred}", styles["context"])
+    sheet.set_row(3, 24)
+    sheet.write_string(3, 0, description, styles["note"])
+    sheet.set_row(4, 24)
+    # A single-row source line can span empty cells while the rule covers the table.
+    for column in range(len(widths)):
+        sheet.write_blank(4, column, None, styles["source"])
+    sheet.write_string(4, 0, f"来源 {source.name}    全国名单覆盖待核实", styles["source"])
+    sheet.set_row(HEADER_ROW, 36)
+    for column, text in enumerate(headings):
+        section = 1 if column in money_columns else 0 if column < frozen else 2
+        sheet.write_string(HEADER_ROW, column, text, styles["headers"][section])
+    sheet.freeze_panes(HEADER_ROW + 1, frozen)
+    sheet.set_landscape()
+    sheet.set_paper(8)  # A3 keeps long cinema names and the audit columns legible.
+    sheet.fit_to_pages(1, 0)
+    sheet.set_margins(0.3, 0.3, 0.4, 0.4)
+    sheet.repeat_rows(HEADER_ROW)
+    sheet.set_footer('&L&"Microsoft YaHei"&9MovieDataDecoder&R第 &P / &N 页')
+
+
+def _name_row_height(name, width):
+    lines = 0
+    for line in name.splitlines():
+        units = sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in line)
+        lines += max(1, math.ceil(units / (width - 4)))
+    return min(409, max(26, lines * 16 + 8))
+
+
+def _finish_sheet(sheet, last_row, columns, styles):
+    sheet.autofilter(HEADER_ROW, 0, last_row, columns - 1)
+    sheet.print_area(0, 0, last_row, columns - 1)
+    # Conditions follow the visible status text after edits or sorting in Excel.
+    for keyword, style in (("异常", "error"), ("不一致", "error"), ("未知", "error"), ("待", "pending")):
+        sheet.conditional_format(HEADER_ROW + 1, 4, last_row, 4,
+                                 {"type": "text", "criteria": "containing", "value": keyword,
+                                  "format": styles[style]})
+
+
 def _write_report(path, scratch, report, source, conn, emit):
     headings = ("影院编码", "影院名称", "已确认票房（元）", "完整区间票房（元）", "核查状态",
                 "已核查天数", "待核查天数", "204 待复核天数", "有该片天数")
-    widths = (15, 43, 23, 25, 21, 16, 16, 20, 15)
+    widths = (14, 44, 21, 23, 27, 13, 13, 18, 13)
     ordered = sorted(report.cinemas.items(), key=lambda item: (not item[1].verified, -item[1].cents, item[0]))
     room = MAX_ROWS - HEADER_ROW - 1
     with xlsxwriter.Workbook(str(path), {"constant_memory": True, "tmpdir": str(scratch),
                                        "strings_to_formulas": False, "strings_to_urls": False}) as book:
-        title = book.add_format({"font_name": "Microsoft YaHei", "font_size": 17, "bold": True, "font_color": "#17365D"})
-        note = book.add_format({"font_color": "#475972", "font_size": 10})
-        header = book.add_format({"bg_color": "#214D7B", "font_color": "white", "bold": True,
-                                  "valign": "vcenter", "text_wrap": True})
-        money = book.add_format({"num_format": "#,##0.00", "font_color": "#17365D"})
-        incomplete = book.add_format({"bg_color": "#FFF3E8", "font_color": "#943C21"})
+        styles = _report_styles(book)
         for part, index in enumerate(range(0, len(ordered), room), 1):
             sheet = book.add_worksheet("逐影院票房" if part == 1 else f"逐影院票房 {part}")
-            sheet.hide_gridlines(2)
-            sheet.set_zoom(90)
-            for column, width in enumerate(widths):
-                sheet.set_column(column, column, width)
-            sheet.set_row(0, 28)
-            sheet.write_string(0, 0, "逐影院票房", title)
-            inferred = "（按明细中的日期推定）" if report.inferred_period else ""
-            sheet.write_string(1, 0, f"电影编码 {report.movie}   ·   {report.start} 至 {report.end}   ·   共 {report.days} 天{inferred}", note)
-            sheet.write_string(2, 0, "已确认票房按有效片目累计。只有核查齐整个区间才填完整区间票房。无有效片目时金额留空。", note)
-            sheet.write_string(3, 0, f"来源 {source.name}   ·   每家已知影院一行，全国名单覆盖待核实。", note)
-            sheet.set_row(HEADER_ROW, 30)
-            sheet.write_row(HEADER_ROW, 0, headings, header)
-            sheet.freeze_panes(HEADER_ROW + 1, 2)
+            _prepare_sheet(sheet, report, source, styles, headings, widths, (2, 3), 2,
+                           "金额单位为元。已确认票房按有效日期累计，核查齐全部日期才填完整区间票房。空白金额表示待核查。", "逐日明细")
             for row, (code, cinema) in enumerate(ordered[index:index + room], HEADER_ROW + 1):
                 pending_days = report.days - cinema.verified
                 if cinema.cents > MAX_CENTS:
                     raise ValueError(f"影院 {code} 的汇总金额超出可安全写入 Excel 的精度范围。")
-                sheet.write_string(row, 0, code)
-                sheet.write_string(row, 1, cinema.name[:32_767])
+                cell = styles["rows"][(row - HEADER_ROW - 1) % 2]
+                sheet.set_row(row, _name_row_height(cinema.name, widths[1]))
+                sheet.write_string(row, 0, code, cell["code"])
+                sheet.write_string(row, 1, cinema.name[:32_767], cell["name"])
+                sheet.write_blank(row, 2, None, cell["money"])
+                sheet.write_blank(row, 3, None, cell["money"])
                 if cinema.verified:
                     amount = Decimal(cinema.cents) / 100
-                    sheet.write_number(row, 2, amount, money)
+                    sheet.write_number(row, 2, amount, cell["money"])
                     if not pending_days and not report.inferred_period:
-                        sheet.write_number(row, 3, amount, money)
+                        sheet.write_number(row, 3, amount, cell["money"])
                 if pending_days:
                     status = "部分日期待核查" if cinema.verified else "待核查"
                 elif report.inferred_period:
                     status = "导出日期范围待核实"
                 else:
                     status = "已核查" if cinema.with_movie else "已核查，无该片"
-                sheet.write_string(row, 4, status, incomplete if pending_days or report.inferred_period else None)
-                sheet.write_row(row, 5, (cinema.verified, pending_days, cinema.deferred, cinema.with_movie))
-            sheet.autofilter(HEADER_ROW, 0, row, len(headings) - 1)
-        _write_daily(book, report, source, conn, emit)
+                sheet.write_string(row, 4, status, cell["status"])
+                sheet.write_row(row, 5, (cinema.verified, pending_days, cinema.deferred, cinema.with_movie), cell["count"])
+            _finish_sheet(sheet, row, len(headings), styles)
+        _write_daily(book, report, source, conn, emit, styles)
 
 
-def _write_daily(book, report, source, conn, emit):
+def _write_daily(book, report, source, conn, emit, styles):
     headings = ("日期", "影院编码", "影院名称", "该片当日票房（元）", "采集状态", "原始状态", "电影编码")
-    widths = (15, 15, 43, 24, 29, 20, 18)
-    title = book.add_format({"font_name": "Microsoft YaHei", "font_size": 17, "bold": True, "font_color": "#17365D"})
-    note = book.add_format({"font_color": "#475972", "font_size": 10})
-    header = book.add_format({"bg_color": "#214D7B", "font_color": "white", "bold": True,
-                              "valign": "vcenter", "text_wrap": True})
-    money = book.add_format({"num_format": "#,##0.00", "font_color": "#17365D"})
-    date_format = book.add_format({"num_format": "yyyy-mm-dd"})
-    pending = book.add_format({"bg_color": "#FFF3E8", "font_color": "#943C21"})
+    widths = (15, 14, 48, 25, 31, 21, 18)
     codes = sorted(report.cinemas)
     sheet, row, part = None, MAX_ROWS, 0
     total = len(codes) * report.days
@@ -275,22 +340,11 @@ def _write_daily(book, report, source, conn, emit):
         for code in codes:
             if row == MAX_ROWS:
                 if sheet is not None:
-                    sheet.autofilter(HEADER_ROW, 0, row - 1, len(headings) - 1)
+                    _finish_sheet(sheet, row - 1, len(headings), styles)
                 part += 1
                 sheet = book.add_worksheet("逐日明细" if part == 1 else f"逐日明细 {part}")
-                sheet.hide_gridlines(2)
-                sheet.set_zoom(90)
-                for column, width in enumerate(widths):
-                    sheet.set_column(column, column, width)
-                sheet.set_row(0, 28)
-                sheet.write_string(0, 0, "每家影院每日票房", title)
-                inferred = "（按明细中的日期推定）" if report.inferred_period else ""
-                sheet.write_string(1, 0, f"电影编码 {report.movie}   ·   {report.start} 至 {report.end}   ·   共 {report.days} 天{inferred}", note)
-                sheet.write_string(2, 0, "每家已知影院每天一行。金额单位为元。204、未采集、异常及缺行的金额留空，已核查无该片记 0。", note)
-                sheet.write_string(3, 0, f"来源 {source.name}   ·   可按日期或影院筛选，全国名单覆盖待核实。", note)
-                sheet.set_row(HEADER_ROW, 30)
-                sheet.write_row(HEADER_ROW, 0, headings, header)
-                sheet.freeze_panes(HEADER_ROW + 1, 3)
+                _prepare_sheet(sheet, report, source, styles, headings, widths, (3,), 3,
+                               "每家影院每天一行，金额单位为元。204、未采集及异常的金额留空，已核查无该片记 0。", "逐影院票房")
                 row = HEADER_ROW + 1
             name = report.cinemas[code].name
             if record is not None and record[0] == code:
@@ -300,18 +354,21 @@ def _write_daily(book, report, source, conn, emit):
                 record = next(cursor, None)
             else:
                 status, cents, status_text = "", None, "源文件缺行，待核查"
-            sheet.write_datetime(row, 0, day, date_format)
-            sheet.write_string(row, 1, code)
-            sheet.write_string(row, 2, name[:32_767])
+            cell = styles["rows"][(row - HEADER_ROW - 1) % 2]
+            sheet.set_row(row, _name_row_height(name, widths[2]))
+            sheet.write_datetime(row, 0, day, cell["date"])
+            sheet.write_string(row, 1, code, cell["code"])
+            sheet.write_string(row, 2, name[:32_767], cell["name"])
+            sheet.write_blank(row, 3, None, cell["money"])
             if cents is not None:
-                sheet.write_number(row, 3, Decimal(cents) / 100, money)
-            sheet.write_string(row, 4, status_text, pending if cents is None else None)
-            sheet.write_string(row, 5, status[:32_767])
-            sheet.write_string(row, 6, report.movie)
+                sheet.write_number(row, 3, Decimal(cents) / 100, cell["money"])
+            sheet.write_string(row, 4, status_text, cell["status"])
+            sheet.write_string(row, 5, status[:32_767], cell["code"])
+            sheet.write_string(row, 6, report.movie, cell["code"])
             row += 1
             written += 1
         emit(f"已生成 {written:,} / {total:,} 行逐日明细…")
-    sheet.autofilter(HEADER_ROW, 0, row - 1, len(headings) - 1)
+    _finish_sheet(sheet, row - 1, len(headings), styles)
 
 
 def convert(source, output, *, emit=lambda message: None):
